@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+backend/venv/
+venv/
+.venv/
+
+# Environment (keep .env.example)
+.env
+backend/.env
+*.env.local
+!.env.example
+!backend/.env.example
+
+# Certs (never commit)
+frontend/certs/
+*.pem
+
+# Build / output
+frontend/dist/
+frontend/extension/build/
+build/
+*.egg-info/
+dist/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/

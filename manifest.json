@@ -1,0 +1,43 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.16/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.16",
+  "version": "1.0.0",
+  "id": "00000000-0000-0000-0000-000000000001",
+  "packageName": "com.meetingmirror.app",
+  "developer": {
+    "name": "MeetingMirror",
+    "websiteUrl": "https://localhost:3000",
+    "privacyUrl": "https://localhost:3000/privacy",
+    "termsOfUseUrl": "https://localhost:3000/terms"
+  },
+  "icons": {
+    "color": "color.png",
+    "outline": "outline.png"
+  },
+  "name": {
+    "short": "MeetingMirror",
+    "full": "MeetingMirror - AI Coaching"
+  },
+  "description": {
+    "short": "Real-time AI coaching for your meetings",
+    "full": "MeetingMirror provides private, real-time AI coaching in a side panel during Microsoft Teams meetings."
+  },
+  "accentColor": "#6264A7",
+  "configurableTabs": [
+    {
+      "configurationUrl": "https://localhost:3000/config",
+      "scopes": ["team", "groupchat"],
+      "meetingSurfaces": ["sidePanel"],
+      "context": [
+        "meetingSidePanel",
+        "meetingChatTab",
+        "meetingDetailsTab"
+      ]
+    }
+  ],
+  "validDomains": [
+    "localhost",
+    "*.ngrok.io",
+    "*.ngrok-free.app"
+  ]
+}
