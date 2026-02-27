@@ -258,40 +258,38 @@ export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewPro
               <VoiceLevelBars deviceId={selectedDeviceId || undefined} active={listening} />
             </div>
 
-            {/* Live interim — current phrase being spoken (updates in real time) */}
-            <div className="px-3 py-2 bg-slate-800/70 min-h-[2.5rem] flex items-center">
-              {interim ? (
-                <p className="text-sm text-emerald-300 italic leading-relaxed">
-                  {interim}
-                  <span className="inline-block w-0.5 h-3.5 ml-0.5 bg-emerald-400 animate-pulse align-middle" />
-                </p>
-              ) : (
+            {/*
+              Unified live transcript — finalised sentences flow continuously as plain text,
+              with the current interim phrase appended at the end (italic + cursor).
+              This mirrors how the reference app renders: one growing text stream, no jump
+              between an "interim box" and a "transcript box".
+            */}
+            <div className="bg-slate-900/60 max-h-72 overflow-y-auto px-3 py-3">
+              {transcriptLines.length === 0 && !interim ? (
                 <span className="text-xs text-slate-500">👂 Waiting for speech…</span>
-              )}
-            </div>
-
-            {/* Full transcript — all finalised lines, scrollable; each line was sent to backend */}
-            <div className="border-t border-slate-700 bg-slate-900/60 max-h-48 overflow-y-auto">
-              <p className="text-xs text-slate-500 px-3 pt-2 pb-1 sticky top-0 bg-slate-900/95">
-                Transcript
-              </p>
-              {transcriptLines.length === 0 ? (
-                <p className="text-xs text-slate-500 italic px-3 py-2">
-                  Finalised phrases will appear here line by line.
-                </p>
               ) : (
-                <ul className="px-3 pb-2 space-y-1 list-none">
-                  {transcriptLines.map((line, i) => (
-                    <li key={i} className="text-sm text-slate-200 leading-relaxed">
-                      {line}
-                    </li>
-                  ))}
-                </ul>
+                <p className="text-sm text-slate-200 leading-relaxed whitespace-pre-wrap">
+                  {transcriptLines.join(' ')}
+                  {/* Interim appended inline — stays at the tail of the stream */}
+                  {interim && (
+                    <>
+                      {transcriptLines.length > 0 ? ' ' : ''}
+                      <span className="text-emerald-300 italic">
+                        {interim}
+                        <span className="inline-block w-0.5 h-3.5 ml-0.5 bg-emerald-400 animate-pulse align-middle" />
+                      </span>
+                    </>
+                  )}
+                  {/* Cursor blink when listening but no interim yet */}
+                  {!interim && transcriptLines.length > 0 && (
+                    <span className="inline-block w-0.5 h-3.5 ml-0.5 bg-slate-500 animate-pulse align-middle opacity-60" />
+                  )}
+                </p>
               )}
               <div ref={transcriptEndRef} className="h-0" aria-hidden />
             </div>
 
-            {/* Stop mic — stops recording; transcript above is kept */}
+            {/* Stop mic — transcript above is kept after stopping */}
             <div className="border-t border-slate-700 px-3 py-2 bg-slate-800/70">
               <button
                 type="button"

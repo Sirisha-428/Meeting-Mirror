@@ -189,27 +189,27 @@ async def websocket_coaching(websocket: WebSocket, meeting_id: str):
                 msg_type = msg.get("type", "")
 
                 if msg_type == "transcript":
-                    # Client sends speech-to-text transcript (from Web Speech API)
+                    # Client sends one finalised sentence at a time (Web Speech API onFinal)
                     transcript = msg.get("text", "").strip()
                     if transcript:
+                        # Accumulate for session context so Gemini maintains cumulative
+                        # filler counts, engagement monitoring, etc. across sentences.
                         meeting_transcript_buffers[meeting_id].append(transcript)
-                        buffer = meeting_transcript_buffers[meeting_id]
-                        full_text = " ".join(buffer)
-                        # Analyze when we have enough text (~8-12 sec of speech)
-                        if len(full_text) > 50:
-                            try:
-                                result = await asyncio.to_thread(
-                                    _process_transcript, meeting_id, full_text
+                        full_context = " ".join(meeting_transcript_buffers[meeting_id])
+                        # Analyse immediately — cooldown in _process_transcript handles rate limiting
+                        try:
+                            result = await asyncio.to_thread(
+                                _process_transcript, meeting_id, full_context
+                            )
+                            if result:
+                                feedback, _ctx = result
+                                fillers = _parse_fillers_from_feedback(feedback)
+                                # Surface the current sentence (not full context) as "transcript"
+                                await _send_feedback(
+                                    meeting_id, feedback, transcript=transcript, fillers=fillers
                                 )
-                                if result:
-                                    feedback, trans = result
-                                    fillers = _parse_fillers_from_feedback(feedback)
-                                    await _send_feedback(
-                                        meeting_id, feedback, transcript=trans, fillers=fillers
-                                    )
-                            except Exception:
-                                pass
-                            meeting_transcript_buffers[meeting_id] = []
+                        except Exception:
+                            pass
 
                 elif msg_type == "process_transcript":
                     # Client sends full transcript for one-shot processing (e.g. after Stop recording)
