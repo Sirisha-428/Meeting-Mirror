@@ -42,71 +42,59 @@ TRANSCRIPTION_PROMPT = (
 # """
 
 COACHING_PROMPT = """
-You are a real-time AI communication coach that continuously listens to user speech and provides structured, cumulative feedback across a session.
-🎯 Goals
-Track filler words cumulatively across sentences
-Improve spoken sentences (clarity, professionalism, conciseness)
-Monitor speaking pace (too fast / too slow)
-Detect voice volume (too low)
-Detect non-English speech usage
-Monitor continuous speaking (audience engagement check)
-Provide short, actionable coaching tips
-🧠 Instructions
-For every new speech input (sentence or chunk):
-1. Filler Words Detection
-Detect filler words from:
-(um, uh, like, basically, you know, so, I mean)
-Return:
-Current Sentence Fillers
-Total Filler Count (Session)
-Filler Breakdown (word-wise cumulative)
-2. Sentence Improvement
-Rewrite the sentence to be:
-Clear
-Concise
-Professional
-Prefix with:
-Improved Sentence:
-3. Speech Pace Detection
-Analyze speaking speed:
-If too fast → "Speaking too fast — slow down for clarity"
-If too slow → "Speaking too slow — maintain a steady pace"
-Else → "Pace is good"
-4. Volume Detection
-If voice is too low → "Voice is low — speak louder"
-Else → "Volume is good"
-5. Language Detection
-If non-English detected:
-"Non-English detected — maintain English for consistency"
-Also maintain:
-Non-English Duration (Session): <time or count>
-6. Engagement Monitoring
-Track if only one speaker is detected:
-If user speaks continuously for >10 minutes:
-"You have been speaking for a while — check audience engagement"
-7. Coaching Suggestion
-Provide ONE short actionable tip (max 12 words)
-🧾 Output Format (STRICT)
-Filler Words (Current): <list or None>
-Filler Count (Total): <number>
-Filler Breakdown: <word: count>
-Improved Sentence: <rewritten version>
+You are a real-time AI communication coach. You will receive ONE sentence that was just spoken.
+Analyse ONLY that sentence — do not reference, summarise, or rewrite anything from outside it.
+
+🧠 Instructions:
+
+1. Filler Words
+   Detect filler words ONLY in this sentence from: (um, uh, like, basically, you know, so, I mean)
+   List every filler word found. If none → None.
+
+2. Improved Sentence
+   Only rewrite if the sentence has a real problem: filler words, unclear phrasing, poor grammar,
+   or unnecessary words. If the sentence is already clear, concise, and professional → output None.
+   When rewriting, improve THIS sentence only — do NOT generalise, add context, or change the meaning.
+
+3. Pace
+   Estimate from word density of this sentence alone:
+   - Very long run-on (>30 words) → "Speaking too fast — slow down for clarity"
+   - Very short (<4 meaningful words) → "Speaking too slow — maintain a steady pace"
+   - Otherwise → "Pace is good"
+
+4. Volume
+   If the sentence looks incomplete or very short → "Voice is low — speak louder"
+   Else → "Volume is good"
+
+5. Language
+   If non-English words appear in this sentence → "Non-English detected — maintain English for consistency"
+   Else → "English"
+
+6. Engagement Alert
+   → None  (per-sentence analysis does not track monologue duration)
+
+7. Suggestion
+   ONE actionable tip (max 12 words) based only on this sentence.
+   If the sentence has NO issues at all → output None.
+
+🧾 Output Format — output ALL fields exactly as shown, no extras:
+Filler Words (Current): <fillers or None>
+Filler Count (Total): <count of fillers in this sentence>
+Filler Breakdown: <word: count, or None>
+Improved Sentence: <rewritten version of THIS sentence only, or None if already good>
 Pace: <too fast / too slow / good>
 Volume: <low / good>
 Language: <English / Non-English detected>
-Non-English Duration (Session): <value>
-Engagement Alert: <message or None>
-Suggestion: <one short tip>
+Non-English Duration (Session): None
+Engagement Alert: None
+Suggestion: <one short tip, or None if no issues>
+
 ❗ Rules
-Always follow exact format
-Do NOT skip any field
-If no issue → return "good" or "None" appropriately
-Maintain session memory:
-filler counts
-non-English duration
-continuous speaking duration
-Keep response concise
-No explanations
+- Analyse ONLY the sentence provided — never reference previous sentences
+- Improved Sentence must be a direct rewrite of the input sentence, not a summary
+- If the sentence is already good → Improved Sentence: None and Suggestion: None
+- Do NOT skip any field; use "None" or "good" when there is no issue
+- No preamble, no explanations, output only the structured fields above
 """
 
 # Priority order for which card to show (first match wins)
@@ -262,25 +250,28 @@ def analyze_audio(audio_base64: str, mime_type: str = "audio/webm") -> Optional[
         return None
 
 
-def analyze_transcript(transcript: str) -> Optional[str]:
+def analyze_transcript(sentence: str) -> Optional[str]:
     """
-    Analyze a text transcript and return a coaching tip or None.
+    Analyse a single spoken sentence and return structured coaching feedback or None.
+    The sentence is analysed in isolation — no accumulated history is passed.
     """
     model = _get_model()
     if not model:
         logger.warning("Gemini coaching skipped: no model (missing key?)")
         return None
-    if not transcript.strip():
+    sentence = sentence.strip()
+    if not sentence:
         return None
     try:
-        logger.info("Gemini: sending transcript for coaching (%d chars)...", len(transcript))
-        response = model.generate_content(COACHING_PROMPT + transcript)
+        logger.info("Gemini: analysing sentence (%d chars): %r", len(sentence), sentence[:80])
+        prompt = COACHING_PROMPT + f"\n\nSentence to analyse:\n{sentence}"
+        response = model.generate_content(prompt)
         text = (response.text or "").strip()
         if not text:
-            logger.info("Gemini: coaching returned empty response — treating as no issues")
+            logger.info("Gemini: coaching returned empty response")
             return "✓ No issues detected — keep it up!"
         if text.upper() == "OK":
-            logger.info("Gemini: coaching → OK (no issues)")
+            logger.info("Gemini: coaching → OK")
             return "✓ No issues — speech looks good"
         logger.info("Gemini: coaching → %r", text[:120])
         return text

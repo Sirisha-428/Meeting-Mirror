@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import os
-import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Dict, Set
@@ -39,13 +38,17 @@ logger.info("API keys loaded — GEMINI_API_KEY: %s | GROQ_API_KEY: %s",
 # Active WebSocket connections per meeting
 active_connections: Dict[str, Set[WebSocket]] = {}
 
-# Per-meeting transcript buffers (for analysis every N seconds of speech)
+# Per-meeting transcript buffers (for display/history)
 meeting_transcript_buffers: Dict[str, list[str]] = {}
 
-# Throttle Gemini calls to avoid API exhaustion (continuous stream -> many segments)
-GEMINI_COOLDOWN_SEC = 15
-MIN_TRANSCRIPT_LEN_FOR_GEMINI = 15
-last_gemini_at: Dict[str, float] = {}
+# Per-meeting queue of sentences waiting for Gemini feedback (processed one after the other)
+coaching_queue: Dict[str, list[str]] = {}
+# One processor task per meeting; when done it's removed so next enqueue starts a new one
+coaching_tasks: Dict[str, "asyncio.Task[None]"] = {}
+
+# Minimum length to enqueue a sentence (avoid sending "ok", "." to Gemini)
+MIN_SENTENCE_LEN_FOR_QUEUE = 5
+MIN_TRANSCRIPT_LEN_FOR_GEMINI = 1  # only skip truly empty; queue already filters short
 
 
 @asynccontextmanager
@@ -53,7 +56,10 @@ async def lifespan(app: FastAPI):
     yield
     active_connections.clear()
     meeting_transcript_buffers.clear()
-    last_gemini_at.clear()
+    coaching_queue.clear()
+    for task in coaching_tasks.values():
+        task.cancel()
+    coaching_tasks.clear()
 
 
 app = FastAPI(title="MeetingMirror API", lifespan=lifespan)
@@ -122,30 +128,46 @@ def _parse_fillers_from_feedback(feedback: str) -> str | None:
     return None
 
 
-def _process_transcript(meeting_id: str, transcript: str) -> tuple[str, str] | None:
-    """Analyze transcript with Gemini. Returns (feedback, transcript) or None.
-    Respects cooldown and minimum length to avoid API exhaustion.
+def _process_transcript_sync(meeting_id: str, transcript: str) -> tuple[str, str] | None:
+    """Synchronous: run Gemini on one sentence. Returns (feedback, transcript) or None.
+    Used by the queue processor; no cooldown — queue serializes calls.
     """
     t = transcript.strip()
     if not t or len(t) < MIN_TRANSCRIPT_LEN_FOR_GEMINI:
-        logger.info("[%s] Gemini coaching SKIPPED — transcript too short (%d chars, need %d)",
-                    meeting_id, len(t), MIN_TRANSCRIPT_LEN_FOR_GEMINI)
         return None
-    now = time.monotonic()
-    if meeting_id in last_gemini_at:
-        elapsed = now - last_gemini_at[meeting_id]
-        if elapsed < GEMINI_COOLDOWN_SEC:
-            logger.info("[%s] Gemini coaching SKIPPED — cooldown (%.1fs remaining)",
-                        meeting_id, GEMINI_COOLDOWN_SEC - elapsed)
-            return None
-    logger.info("[%s] Sending transcript to Gemini for coaching: %r", meeting_id, t[:80])
+    logger.info("[%s] Gemini coaching: %r", meeting_id, t[:80])
     result = analyze_transcript(t)
     if result is None:
-        logger.warning("[%s] Gemini coaching returned None (API error or key missing)", meeting_id)
+        logger.warning("[%s] Gemini coaching returned None", meeting_id)
         return None
     logger.info("[%s] Gemini coaching response: %r", meeting_id, result[:120])
-    last_gemini_at[meeting_id] = now
     return (result, t)
+
+
+async def _process_coaching_queue(meeting_id: str) -> None:
+    """Process the coaching queue for this meeting one sentence at a time.
+    Runs until the queue is empty; then exits so the next enqueue can start a new task.
+    """
+    queue = coaching_queue.get(meeting_id)
+    if not queue:
+        return
+    while queue:
+        sentence = queue.pop(0)
+        if not sentence or not sentence.strip():
+            continue
+        try:
+            result = await asyncio.to_thread(_process_transcript_sync, meeting_id, sentence)
+            if result:
+                feedback, _ = result
+                fillers = _parse_fillers_from_feedback(feedback)
+                await _send_feedback(
+                    meeting_id, feedback, transcript=sentence, fillers=fillers
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("[%s] Coaching queue processing failed: %s", meeting_id, e)
+    coaching_tasks.pop(meeting_id, None)
 
 
 def _process_audio_base64(meeting_id: str, audio_b64: str, mime: str = "audio/webm") -> str | None:
@@ -170,7 +192,7 @@ async def websocket_coaching(websocket: WebSocket, meeting_id: str):
         mode = "Groq Whisper + Gemini" if has_groq else "Gemini (transcription + coaching)"
         await _send_feedback(
             meeting_id,
-            f"MeetingMirror is listening — speak and tips will appear. ({mode})",
+            f"MeetingMirror is listening — speak and tips will appear.",
         )
     else:
         await _send_feedback(
@@ -189,27 +211,22 @@ async def websocket_coaching(websocket: WebSocket, meeting_id: str):
                 msg_type = msg.get("type", "")
 
                 if msg_type == "transcript":
-                    # Client sends speech-to-text transcript (from Web Speech API)
+                    # Client sends one finalised sentence at a time (Web Speech API onFinal).
+                    # Enqueue for Gemini; process one after the other so every sentence gets feedback.
                     transcript = msg.get("text", "").strip()
-                    if transcript:
-                        meeting_transcript_buffers[meeting_id].append(transcript)
-                        buffer = meeting_transcript_buffers[meeting_id]
-                        full_text = " ".join(buffer)
-                        # Analyze when we have enough text (~8-12 sec of speech)
-                        if len(full_text) > 50:
-                            try:
-                                result = await asyncio.to_thread(
-                                    _process_transcript, meeting_id, full_text
-                                )
-                                if result:
-                                    feedback, trans = result
-                                    fillers = _parse_fillers_from_feedback(feedback)
-                                    await _send_feedback(
-                                        meeting_id, feedback, transcript=trans, fillers=fillers
-                                    )
-                            except Exception:
-                                pass
-                            meeting_transcript_buffers[meeting_id] = []
+                    if not transcript:
+                        continue
+                    meeting_transcript_buffers[meeting_id].append(transcript)
+                    if len(transcript) < MIN_SENTENCE_LEN_FOR_QUEUE:
+                        continue
+                    if meeting_id not in coaching_queue:
+                        coaching_queue[meeting_id] = []
+                    coaching_queue[meeting_id].append(transcript)
+                    task = coaching_tasks.get(meeting_id)
+                    if task is None or task.done():
+                        coaching_tasks[meeting_id] = asyncio.create_task(
+                            _process_coaching_queue(meeting_id)
+                        )
 
                 elif msg_type == "process_transcript":
                     # Client sends full transcript for one-shot processing (e.g. after Stop recording)
@@ -258,7 +275,7 @@ async def websocket_coaching(websocket: WebSocket, meeting_id: str):
                         if transcript:
                             await _send_transcript(meeting_id, transcript)
                             result = await asyncio.to_thread(
-                                _process_transcript, meeting_id, transcript
+                                _process_transcript_sync, meeting_id, transcript
                             )
                             if result:
                                 feedback, trans = result
@@ -278,6 +295,14 @@ async def websocket_coaching(websocket: WebSocket, meeting_id: str):
             if not active_connections[meeting_id]:
                 del active_connections[meeting_id]
         meeting_transcript_buffers.pop(meeting_id, None)
+        coaching_queue.pop(meeting_id, None)
+        task = coaching_tasks.pop(meeting_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 @app.get("/health")
