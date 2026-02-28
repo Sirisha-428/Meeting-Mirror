@@ -192,7 +192,7 @@ async def websocket_coaching(websocket: WebSocket, meeting_id: str):
         mode = "Groq Whisper + Gemini" if has_groq else "Gemini (transcription + coaching)"
         await _send_feedback(
             meeting_id,
-            f"MeetingMirror is listening — speak and tips will appear. ({mode})",
+            f"MeetingMirror is listening — speak and tips will appear.",
         )
     else:
         await _send_feedback(
