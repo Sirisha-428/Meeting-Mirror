@@ -5,6 +5,7 @@
   "description": "Real-time AI coaching for Google Meet",
   "permissions": [
     "storage",
+    "tabs",
     "activeTab",
     "sidePanel"
   ],

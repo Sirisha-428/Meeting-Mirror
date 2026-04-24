@@ -1,9 +1,27 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { useCoachingWebSocket, type FeedbackMessage } from '../hooks/useCoachingWebSocket';
+import {
+  useCoachingWebSocket,
+  type CoachingInsights,
+  type CoachingMessage,
+  type MeetingSummaryReport,
+} from '../hooks/useCoachingWebSocket';
 import { useSpeechTranscription } from '../hooks/useSpeechTranscription';
+import {
+  sendMeetCoachToast,
+  sendMeetCoachToastBatch,
+  type MeetToastVariant,
+} from '../utils/meetPageToastBridge';
 
 const MIC_DEVICE_KEY = 'meetingmirror-mic-device';
 const RECOGNITION_LANG_KEY = 'meetingmirror-recognition-lang';
+const TOAST_DURATION_MS = 3000;
+
+function toastVariantForMessage(line: string): MeetToastVariant {
+  const l = line.toLowerCase();
+  if (l.includes('filler')) return 'warning';
+  if (l.includes('clearly') || l.includes('structure') || l.includes('concise')) return 'suggestion';
+  return 'default';
+}
 
 const RECOGNITION_LANGUAGES: { value: string; label: string }[] = [
   { value: 'en-US', label: 'English (US)' },
@@ -26,19 +44,38 @@ interface LiveCoachingViewProps {
 }
 
 export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewProps) {
-  const { feedbackMessage, status, sendTranscript, sendProcessTranscript } = useCoachingWebSocket(meetingId);
+  const {
+    coachingMessage,
+    meetingSummary,
+    setMeetingSummary,
+    status,
+    sendTranscript,
+    sendProcessTranscript,
+    requestSummary,
+    resetSession,
+  } = useCoachingWebSocket(meetingId);
 
-  /** All feedback from this session — newest first (prepend on new feedback) */
-  const [feedbackHistory, setFeedbackHistory] = useState<{ id: string; msg: FeedbackMessage }[]>([]);
+  const clearMeetToasts = useCallback(() => {
+    sendMeetCoachToast({ message: null });
+  }, []);
 
-  // Full transcript: one line per finalised phrase (persists for the session)
+  const [feedbackHistory, setFeedbackHistory] = useState<{ id: string; msg: CoachingMessage }[]>([]);
+  const internalLinesRef = useRef<string[]>([]);
   const [transcriptLines, setTranscriptLines] = useState<string[]>([]);
+  const [sessionPhraseCount, setSessionPhraseCount] = useState(0);
   const [processing, setProcessing] = useState(false);
-  /** Result from the last "Process" click — shown in Live feedback box below Process button */
-  const [processResult, setProcessResult] = useState<FeedbackMessage | null>(null);
+  const [processResult, setProcessResult] = useState<CoachingMessage | null>(null);
+  const processingResponsePendingRef = useRef(false);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
 
-  // ── Microphone device picker ──────────────────────────────────────────
+  useEffect(() => {
+    internalLinesRef.current = [];
+    setTranscriptLines([]);
+    setSessionPhraseCount(0);
+    setFeedbackHistory([]);
+    setProcessResult(null);
+  }, [meetingId]);
+
   const [micDevices, setMicDevices] = useState<MediaDeviceInfo[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState<string>(
     () => localStorage.getItem(MIC_DEVICE_KEY) ?? ''
@@ -56,7 +93,9 @@ export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewPro
     }
   }, []);
 
-  useEffect(() => { enumerateDevices(); }, [enumerateDevices]);
+  useEffect(() => {
+    enumerateDevices();
+  }, [enumerateDevices]);
 
   const handleDeviceChange = (id: string) => {
     setSelectedDeviceId(id);
@@ -66,14 +105,14 @@ export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewPro
     setRecognitionLang(lang);
     localStorage.setItem(RECOGNITION_LANG_KEY, lang);
   };
-  // ─────────────────────────────────────────────────────────────────────
 
-  // When a phrase is finalised: append as a new line, send that line to backend for Gemini
   const handleFinalTranscript = useCallback(
     (text: string) => {
       const line = text.trim();
       if (!line) return;
+      internalLinesRef.current.push(line);
       setTranscriptLines((prev) => [...prev, line]);
+      setSessionPhraseCount((c) => c + 1);
       sendTranscript(line);
     },
     [sendTranscript]
@@ -88,43 +127,105 @@ export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewPro
     error: recognitionError,
   } = useSpeechTranscription(handleFinalTranscript, status === 'connected', recognitionLang);
 
-  useEffect(() => {
-    transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [transcriptLines, interim]);
-
-  useEffect(() => {
-    if (feedbackMessage?.feedback) {
-      if (processing) {
-        setProcessResult(feedbackMessage);
-      }
-      setProcessing(false);
-      setFeedbackHistory((prev) => [
-        { id: crypto.randomUUID(), msg: feedbackMessage },
-        ...prev.slice(0, 49),
-      ]);
-    }
-  }, [feedbackMessage, processing]);
-
-  // Chrome requires user gesture to start mic — user must click to start
   const [listening, setListening] = useState(false);
   const handleStartListening = async () => {
     if (status === 'connected' && speechSupported) {
+      resetSession();
+      clearMeetToasts();
+      internalLinesRef.current = [];
+      setTranscriptLines([]);
+      setSessionPhraseCount(0);
+      setFeedbackHistory([]);
+      setProcessResult(null);
+      setMeetingSummary(null);
       const ok = await startListening();
       if (ok) await enumerateDevices();
       setListening(ok);
     }
   };
+
   const handleStopListening = () => {
     stopListening();
     setListening(false);
+    requestSummary();
   };
+
   useEffect(() => {
     setListening(isListening);
   }, [isListening]);
+
   useEffect(() => {
-    if (status !== 'connected') setListening(false);
+    if (status !== 'connected') {
+      setListening(false);
+      clearMeetToasts();
+    }
     return () => stopListening();
-  }, [status, stopListening]);
+  }, [status, stopListening, clearMeetToasts]);
+
+  useEffect(() => {
+    if (!coachingMessage?.toastMessages?.length) return;
+
+    sendMeetCoachToastBatch(
+      coachingMessage.toastMessages.map((message) => ({
+        message,
+        variant: toastVariantForMessage(message),
+        durationMs: TOAST_DURATION_MS,
+      })),
+      TOAST_DURATION_MS
+    );
+
+    if (coachingMessage.system) {
+      if (processingResponsePendingRef.current) {
+        processingResponsePendingRef.current = false;
+        setProcessing(false);
+      }
+      return;
+    }
+
+    if (processingResponsePendingRef.current) {
+      setProcessResult(coachingMessage);
+      processingResponsePendingRef.current = false;
+      setProcessing(false);
+      return;
+    }
+
+    setFeedbackHistory((prev) => [
+      { id: crypto.randomUUID(), msg: coachingMessage },
+      ...prev.slice(0, 49),
+    ]);
+  }, [coachingMessage]);
+
+  useEffect(() => {
+    transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [transcriptLines, interim]);
+
+  useEffect(() => {
+    return () => {
+      sendMeetCoachToast({ message: null });
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!meetingSummary) return;
+    const lines: string[] = [];
+    lines.push('Summary report:');
+    lines.push(
+      `Filler words: ${meetingSummary.totalFillerWords}` +
+        (meetingSummary.mostUsedFillerWords.length
+          ? ` (${meetingSummary.mostUsedFillerWords.slice(0, 3).join(', ')})`
+          : '')
+    );
+    lines.push(`Pace: ${meetingSummary.speakingPace}`);
+    lines.push(`Volume: ${meetingSummary.volumeAnalysis}`);
+    lines.push(`Clarity score: ${meetingSummary.clarityScore}/100`);
+    if (meetingSummary.improvements.length) {
+      lines.push(`Suggestion: ${meetingSummary.improvements[0]}`);
+    }
+    sendMeetCoachToastBatch(
+      lines.map((message) => ({ message, durationMs: TOAST_DURATION_MS })),
+      TOAST_DURATION_MS
+    );
+  }, [meetingSummary]);
 
   const statusLabel =
     status === 'connected' ? 'Live' : status === 'failed' ? 'Connection failed' : 'Connecting...';
@@ -137,12 +238,9 @@ export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewPro
 
   return (
     <div className="min-h-screen bg-slate-900 text-white flex flex-col">
-      {/* Header */}
       <header className="p-4 border-b border-slate-700">
         <div className="flex items-center justify-between gap-2">
-          <h1 className="text-lg font-semibold text-teams-purple">
-            MeetingMirror
-          </h1>
+          <h1 className="text-lg font-semibold text-teams-purple">MeetingMirror</h1>
           <div className="flex items-center gap-2">
             {listening && interim && (
               <span className="flex items-center gap-1 text-xs text-emerald-400 animate-pulse font-medium">
@@ -156,23 +254,18 @@ export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewPro
                 Listening
               </span>
             )}
-            <span className={`text-xs px-2 py-1 rounded-full shrink-0 ${statusStyle}`}>
-              {statusLabel}
-            </span>
+            <span className={`text-xs px-2 py-1 rounded-full shrink-0 ${statusStyle}`}>{statusLabel}</span>
           </div>
         </div>
       </header>
 
-      {/* Content */}
       <main className="flex-1 p-4 overflow-auto">
         {status === 'failed' && (
           <div className="mb-4 p-4 rounded-lg bg-red-500/10 border border-red-500/30 text-red-200 text-sm">
             <p className="font-medium">Could not connect to coaching service</p>
             <p className="mt-2 text-red-300/80 text-xs">
-              Make sure the backend is running with HTTPS: <code className="bg-slate-800 px-1 rounded">cd backend && python run_dev.py</code>
-            </p>
-            <p className="mt-1 text-red-300/80 text-xs">
-              If using mkcert, generate certs first: <code className="bg-slate-800 px-1 rounded">mkcert -key-file frontend/certs/localhost-key.pem -cert-file frontend/certs/localhost.pem localhost</code>
+              Make sure the backend is running with HTTPS:{' '}
+              <code className="bg-slate-800 px-1 rounded">cd backend && python run_dev.py</code>
             </p>
           </div>
         )}
@@ -184,11 +277,8 @@ export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewPro
 
         {isInMeeting && status === 'connected' && !listening && speechSupported && (
           <div className="mb-4 p-4 rounded-lg bg-teams-purple/20 border border-teams-purple/50 space-y-3">
-            {/* Microphone device picker */}
             <div>
-              <label className="block text-xs text-slate-400 mb-1 font-medium">
-                🎤 Microphone
-              </label>
+              <label className="block text-xs text-slate-400 mb-1 font-medium">🎤 Microphone</label>
               {micDevices.length > 0 ? (
                 <select
                   value={selectedDeviceId}
@@ -208,20 +298,20 @@ export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewPro
               )}
             </div>
             <div>
-              <label className="block text-xs text-slate-400 mb-1 font-medium">
-                🌐 Recognition language
-              </label>
+              <label className="block text-xs text-slate-400 mb-1 font-medium">🌐 Recognition language</label>
               <select
                 value={recognitionLang}
                 onChange={(e) => handleRecognitionLangChange(e.target.value)}
                 className="w-full bg-slate-800 border border-slate-600 text-slate-200 text-sm rounded-md px-3 py-2 focus:outline-none focus:border-teams-purple"
               >
                 {RECOGNITION_LANGUAGES.map(({ value, label }) => (
-                  <option key={value} value={value}>{label}</option>
+                  <option key={value} value={value}>
+                    {label}
+                  </option>
                 ))}
               </select>
               <p className="text-xs text-slate-500 mt-0.5">
-                Mic will transcribe in this language. For coaching tips in English, speak in English.
+                Speech is analysed in the background. Only short coaching tips appear on Meet — never your words.
               </p>
             </div>
             <button
@@ -230,9 +320,6 @@ export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewPro
             >
               Start listening
             </button>
-            <p className="text-xs text-slate-400 text-center">
-              Chrome transcribes live — Gemini gives coaching tips
-            </p>
           </div>
         )}
 
@@ -245,32 +332,23 @@ export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewPro
         {recognitionError && (
           <div className="mb-4 p-4 rounded-lg bg-red-500/20 border border-red-500/50 text-red-200 text-sm">
             <p className="font-medium">{recognitionError}</p>
-            <div className="mt-2 text-xs text-red-300/80 space-y-1">
-              <p>Allow microphone in Chrome: click the lock icon → Microphone → Allow.</p>
-            </div>
           </div>
         )}
 
         {isInMeeting && status === 'connected' && listening && (
           <div className="mb-4 rounded-lg border border-slate-600 overflow-hidden">
-            {/* Voice level bars */}
+            <p className="text-xs text-slate-400 px-3 pt-2 pb-1 bg-slate-800/70 border-b border-slate-700/80">
+              Coaching tips appear on Meet (top-right) and in this panel. Live transcript is shown below.
+            </p>
             <div className="px-3 pt-3 pb-1 bg-slate-800/70">
               <VoiceLevelBars deviceId={selectedDeviceId || undefined} active={listening} />
             </div>
-
-            {/*
-              Unified live transcript — finalised sentences flow continuously as plain text,
-              with the current interim phrase appended at the end (italic + cursor).
-              This mirrors how the reference app renders: one growing text stream, no jump
-              between an "interim box" and a "transcript box".
-            */}
             <div className="bg-slate-900/60 max-h-72 overflow-y-auto px-3 py-3">
               {transcriptLines.length === 0 && !interim ? (
-                <span className="text-xs text-slate-500">👂 Waiting for speech…</span>
+                <p className="text-sm text-slate-500">Listening — keep speaking naturally.</p>
               ) : (
                 <p className="text-sm text-slate-200 leading-relaxed whitespace-pre-wrap">
                   {transcriptLines.join(' ')}
-                  {/* Interim appended inline — stays at the tail of the stream */}
                   {interim && (
                     <>
                       {transcriptLines.length > 0 ? ' ' : ''}
@@ -280,186 +358,227 @@ export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewPro
                       </span>
                     </>
                   )}
-                  {/* Cursor blink when listening but no interim yet */}
-                  {!interim && transcriptLines.length > 0 && (
-                    <span className="inline-block w-0.5 h-3.5 ml-0.5 bg-slate-500 animate-pulse align-middle opacity-60" />
-                  )}
                 </p>
               )}
               <div ref={transcriptEndRef} className="h-0" aria-hidden />
             </div>
-
-            {/* Stop mic — transcript above is kept after stopping */}
             <div className="border-t border-slate-700 px-3 py-2 bg-slate-800/70">
               <button
                 type="button"
                 onClick={handleStopListening}
                 className="w-full py-2 px-4 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-300 text-sm font-medium border border-red-500/40"
               >
-                Stop mic
+                Stop mic &amp; show summary
               </button>
             </div>
           </div>
         )}
 
-        {/* Persisted transcript when mic is stopped — entire speech stays visible + Process */}
-        {isInMeeting && status === 'connected' && !listening && transcriptLines.length > 0 && (
+        {isInMeeting && status === 'connected' && !listening && sessionPhraseCount > 0 && (
           <div className="mb-4 rounded-lg border border-slate-600 overflow-hidden">
             <p className="text-xs text-slate-500 px-3 pt-2 pb-1 bg-slate-800/70 border-b border-slate-700">
-              Transcript (stopped)
+              Session has {sessionPhraseCount} phrase{sessionPhraseCount === 1 ? '' : 's'} captured (text stays private).
             </p>
-            <div className="max-h-64 overflow-y-auto bg-slate-900/60 px-3 py-2">
-              <ul className="space-y-1 list-none">
-                {transcriptLines.map((line, i) => (
-                  <li key={i} className="text-sm text-slate-200 leading-relaxed">
-                    {line}
-                  </li>
-                ))}
-              </ul>
-            </div>
             <div className="border-t border-slate-700 px-3 py-2 bg-slate-800/70">
               <button
                 type="button"
                 onClick={() => {
                   setProcessResult(null);
+                  processingResponsePendingRef.current = true;
                   setProcessing(true);
-                  sendProcessTranscript(transcriptLines.join(' '));
+                  sendProcessTranscript(internalLinesRef.current.join(' '));
                 }}
                 disabled={processing}
                 className="w-full py-2 px-4 rounded-lg bg-teams-purple hover:bg-purple-600 disabled:opacity-50 text-white text-sm font-medium"
               >
-                {processing ? 'Processing…' : 'Process'}
+                {processing ? 'Processing…' : 'Run coaching on session (no transcript shown)'}
               </button>
             </div>
-
-            {/* Gemini result for this transcript — shown below Process */}
             {(processing || processResult) && (
               <div className="border-t border-slate-700 px-3 py-3 bg-slate-900/80">
-                <p className="text-xs text-slate-500 mb-2 font-medium">Live feedback</p>
+                <p className="text-xs text-slate-500 mb-2 font-medium">Latest structured feedback</p>
                 {processing ? (
-                  <p className="text-sm text-slate-400 italic">Processing with Gemini…</p>
+                  <p className="text-sm text-slate-400 italic">Processing…</p>
                 ) : processResult ? (
-                  <div key={processResult.feedback?.slice(0, 50)} className="transition-opacity duration-300">
-                    <FeedbackCard msg={processResult} />
-                  </div>
+                  <InsightsCard insights={processResult.insights} />
                 ) : null}
               </div>
             )}
           </div>
         )}
 
-        {/* All feedback — newest first; each card shows full feedback (original + suggested, fillers, etc.) */}
         {feedbackHistory.length > 0 && (
           <section className="mb-4">
-            <h2 className="text-sm font-medium text-slate-400 mb-2">All feedback</h2>
+            <h2 className="text-sm font-medium text-slate-400 mb-2">Session insights</h2>
             <ul className="space-y-3 list-none">
               {feedbackHistory.map(({ id, msg }) => (
                 <li key={id}>
-                  <FeedbackCard msg={msg} />
+                  <InsightsCard insights={msg.insights} />
                 </li>
               ))}
             </ul>
           </section>
         )}
       </main>
+
+      {meetingSummary && (
+        <SummaryModal summary={meetingSummary} onClose={() => setMeetingSummary(null)} />
+      )}
     </div>
   );
 }
 
-/** Full feedback card — shows all sections that have content (what you said, fillers, suggested sentence, pace/volume, engagement, improvement tip, other language). */
-function FeedbackCard({ msg }: { msg: FeedbackMessage }) {
-  const cardClass = 'rounded-xl shadow-lg p-4 transition-all duration-300 bg-slate-800/60 border border-slate-600';
-  const hasFiller = !!(msg.fillers && msg.fillers.trim());
-  const hasSuggested = !!(msg.improved_sentence && msg.improved_sentence.trim());
-  const hasPace = !!(msg.pace && msg.pace.trim());
-  const hasVolume = !!(msg.volume && msg.volume.trim());
-  const hasPaceVolumeIssue = (msg.pace && msg.pace !== 'good') || msg.volume === 'low';
-  const hasEngagement = !!(msg.engagement_alert && msg.engagement_alert.trim());
-  const hasSuggestion = !!(msg.suggestion && msg.suggestion.trim());
-  const hasTranscript = !!(msg.transcript && msg.transcript.trim());
-  const hasOtherLanguage = msg.language_detected === 'non_english';
+function InsightsCard({ insights }: { insights: CoachingInsights }) {
+  const cardClass =
+    'rounded-xl shadow-lg p-4 transition-all duration-300 bg-slate-800/60 border border-slate-600';
+  const fillers = insights.fillerWordsDetected?.length
+    ? insights.fillerWordsDetected.join(', ')
+    : null;
 
   return (
     <div className={cardClass}>
-      {/* What you said (original) — always show when we have transcript */}
-      {hasTranscript && (
-        <div className="mb-3">
-          <p className="text-xs font-medium text-slate-400 uppercase tracking-wide mb-1">What you said</p>
-          <p className="text-sm text-slate-300 leading-relaxed">&ldquo;{msg.transcript}&rdquo;</p>
+      {fillers && (
+        <div className="mb-2">
+          <p className="text-xs font-medium text-amber-400 uppercase tracking-wide mb-1">Filler words</p>
+          <p className="text-sm text-amber-200">{fillers}</p>
         </div>
       )}
-
-      {/* Suggested sentence — show both original (above) and improved */}
-      {hasSuggested && (
-        <div className="mb-3">
-          <p className="text-xs font-medium text-blue-400 uppercase tracking-wide mb-1">Suggested sentence</p>
-          <p className="text-base text-blue-100 leading-relaxed font-medium">{msg.improved_sentence}</p>
-        </div>
-      )}
-
-      {/* Filler words */}
-      {hasFiller && (
-        <div className="mb-3">
-          <p className="text-xs font-medium text-amber-400 uppercase tracking-wide mb-1">Filler words detected</p>
-          <p className="text-sm text-amber-200">
-            {msg.fillers}
-            {msg.filler_breakdown && <span className="text-amber-300/80 ml-1">({msg.filler_breakdown})</span>}
-          </p>
-        </div>
-      )}
-
-      {/* Pace / Volume — always show when present (Speech pace + Volume) */}
-      {(hasPace || hasVolume) && (
-        <div className="mb-3">
-          <p className="text-xs font-medium text-red-400 uppercase tracking-wide mb-1">Speech pace &amp; volume</p>
-          <p className="text-sm text-slate-200">
-            {hasPace && <span>Pace: {msg.pace}. </span>}
-            {hasVolume && <span>Volume: {msg.volume}.</span>}
-            {hasPaceVolumeIssue && (
-              <span className="text-red-200 ml-0.5">
-                {msg.volume === 'low' && ' Try speaking a bit louder.'}
-                {msg.pace && msg.pace !== 'good' && ' Consider adjusting your speaking pace.'}
-              </span>
-            )}
-          </p>
-        </div>
-      )}
-
-      {/* Other language detected — suggest English for better communication */}
-      {hasOtherLanguage && (
-        <div className="mb-3 p-3 rounded-lg bg-amber-500/15 border border-amber-500/40">
-          <p className="text-xs font-medium text-amber-400 uppercase tracking-wide mb-1">Other language detected</p>
-          <p className="text-sm text-amber-200">
-            {msg.non_english_message?.trim() || 'Non-English speech was detected.'} For better coaching and transcription, try speaking in English.
-          </p>
-        </div>
-      )}
-
-      {/* Engagement */}
-      {hasEngagement && (
-        <div className="mb-3">
-          <p className="text-xs font-medium text-violet-400 uppercase tracking-wide mb-1">Engagement</p>
-          <p className="text-sm text-violet-200">{msg.engagement_alert}</p>
-        </div>
-      )}
-
-      {/* Improvement for next speech / tip */}
-      {hasSuggestion && (
+      <div className="mb-2 text-sm text-slate-200 space-y-1">
+        <p>
+          <span className="text-slate-400">Pace:</span> {insights.pace}
+        </p>
+        <p>
+          <span className="text-slate-400">Volume:</span> {insights.volume}
+        </p>
+        <p>
+          <span className="text-slate-400">Clarity:</span> {insights.clarity}
+        </p>
+      </div>
+      {insights.suggestions?.length > 0 && (
         <div>
-          <p className="text-xs font-medium text-emerald-400 uppercase tracking-wide mb-1">Improvement for next speech</p>
-          <p className="text-sm text-emerald-200">{msg.suggestion}</p>
+          <p className="text-xs font-medium text-emerald-400 uppercase tracking-wide mb-1">Tips</p>
+          <ul className="list-disc list-inside text-sm text-emerald-200 space-y-1">
+            {insights.suggestions.map((s, i) => (
+              <li key={i}>{s}</li>
+            ))}
+          </ul>
         </div>
-      )}
-
-      {/* Fallback when nothing parsed (e.g. welcome message) */}
-      {!hasTranscript && !hasSuggested && !hasFiller && !hasPace && !hasVolume && !hasEngagement && !hasSuggestion && !hasOtherLanguage && (
-        <p className="text-sm text-slate-300">{msg.feedback}</p>
       )}
     </div>
   );
 }
 
-/** Real-time microphone level visualizer — 12 animated bars driven by Web Audio AnalyserNode. */
+function SummaryModal({
+  summary,
+  onClose,
+}: {
+  summary: MeetingSummaryReport;
+  onClose: () => void;
+}) {
+  const downloadJson = () => {
+    const blob = new Blob([JSON.stringify(summary, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'meetingmirror-summary.json';
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const altEntries = Object.entries(summary.suggestedAlternatives ?? {});
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="summary-title"
+    >
+      <div className="bg-slate-900 border border-slate-600 rounded-xl max-w-lg w-full max-h-[90vh] overflow-y-auto shadow-2xl">
+        <div className="sticky top-0 bg-slate-900/95 border-b border-slate-700 px-4 py-3 flex items-center justify-between gap-2">
+          <h2 id="summary-title" className="text-lg font-semibold text-white">
+            Meeting summary
+          </h2>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={downloadJson}
+              className="text-xs px-3 py-1.5 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200"
+            >
+              Download JSON
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              className="text-xs px-3 py-1.5 rounded-lg bg-teams-purple hover:bg-purple-600 text-white"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+        <div className="p-4 space-y-5 text-sm text-slate-200">
+          <section>
+            <h3 className="text-xs font-semibold text-amber-400 uppercase tracking-wide mb-2">
+              1. Filler words
+            </h3>
+            <p>Total detected: {summary.totalFillerWords}</p>
+            {summary.mostUsedFillerWords?.length > 0 && (
+              <p className="mt-1 text-slate-300">
+                Most used: {summary.mostUsedFillerWords.join(', ')}
+              </p>
+            )}
+          </section>
+          <section>
+            <h3 className="text-xs font-semibold text-sky-400 uppercase tracking-wide mb-2">
+              2. Speaking pace
+            </h3>
+            <p className="capitalize">{summary.speakingPace.replace(/-/g, ' ')}</p>
+          </section>
+          <section>
+            <h3 className="text-xs font-semibold text-violet-400 uppercase tracking-wide mb-2">
+              3. Volume &amp; clarity
+            </h3>
+            <p>Volume: {summary.volumeAnalysis}</p>
+            <p>Clarity score: {summary.clarityScore}/100</p>
+          </section>
+          <section>
+            <h3 className="text-xs font-semibold text-emerald-400 uppercase tracking-wide mb-2">
+              4. Actionable improvements
+            </h3>
+            {summary.improvements?.length ? (
+              <ul className="list-disc list-inside space-y-1">
+                {summary.improvements.map((x, i) => (
+                  <li key={i}>{x}</li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-slate-500">No major issues recorded.</p>
+            )}
+          </section>
+          <section>
+            <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">
+              5. Better word suggestions
+            </h3>
+            {altEntries.length === 0 ? (
+              <p className="text-slate-500">No filler replacements suggested.</p>
+            ) : (
+              <ul className="space-y-2 list-none">
+                {altEntries.map(([word, alts]) => (
+                  <li key={word} className="text-slate-300">
+                    <span className="text-amber-200 font-medium">{word}</span>
+                    <span className="text-slate-500"> → </span>
+                    {alts.join(', ')}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function VoiceLevelBars({ deviceId, active }: { deviceId?: string; active: boolean }) {
   const BAR_COUNT = 12;
   const [levels, setLevels] = useState<number[]>(Array(BAR_COUNT).fill(0));
@@ -482,7 +601,10 @@ function VoiceLevelBars({ deviceId, active }: { deviceId?: string; active: boole
         stream = await navigator.mediaDevices.getUserMedia({
           audio: deviceId ? { deviceId: { ideal: deviceId } } : true,
         });
-        if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return; }
+        if (cancelled) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
 
         audioCtx = new AudioContext();
         const source = audioCtx.createMediaStreamSource(stream);
@@ -496,16 +618,12 @@ function VoiceLevelBars({ deviceId, active }: { deviceId?: string; active: boole
         const tick = () => {
           if (cancelled) return;
           analyser.getByteTimeDomainData(timeDomain);
-
-          // RMS amplitude in 0..1
           let sum = 0;
           for (let i = 0; i < timeDomain.length; i++) {
             const v = timeDomain[i] / 128 - 1;
             sum += v * v;
           }
           const rms = Math.sqrt(sum / timeDomain.length);
-
-          // Each bar gets a phase-shifted sine multiplier so they ripple independently
           const now = Date.now();
           const newLevels = Array.from({ length: BAR_COUNT }, (_, i) => {
             const phase = Math.sin(now / 180 + i * 0.55) * 0.4 + 0.6;
@@ -516,7 +634,7 @@ function VoiceLevelBars({ deviceId, active }: { deviceId?: string; active: boole
         };
         tick();
       } catch {
-        // mic already open by VAD — visualizer is best-effort
+        // visualizer is best-effort
       }
     })();
 
@@ -529,10 +647,9 @@ function VoiceLevelBars({ deviceId, active }: { deviceId?: string; active: boole
     return () => cleanupRef.current?.();
   }, [active, deviceId]);
 
-  // Bar heights: center bars are taller by design (bell-curve multiplier)
   const bellCurve = Array.from({ length: BAR_COUNT }, (_, i) => {
-    const x = (i / (BAR_COUNT - 1)) * 2 - 1; // -1 to 1
-    return Math.exp(-x * x * 1.8);            // gaussian envelope
+    const x = (i / (BAR_COUNT - 1)) * 2 - 1;
+    return Math.exp(-x * x * 1.8);
   });
 
   return (
@@ -548,8 +665,8 @@ function VoiceLevelBars({ deviceId, active }: { deviceId?: string; active: boole
               width: '5px',
               height: `${height * 100}%`,
               backgroundColor: speaking
-                ? `rgba(168,85,247,${0.5 + height * 0.5})`  // purple, brighter when louder
-                : 'rgba(100,116,139,0.35)',                   // slate when quiet
+                ? `rgba(168,85,247,${0.5 + height * 0.5})`
+                : 'rgba(100,116,139,0.35)',
             }}
           />
         );

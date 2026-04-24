@@ -35,7 +35,7 @@ pip install -r requirements.txt
 ```
 
 **Add your API keys** for real-time AI coaching:
-
+ 
 ```bash
 cp .env.example .env
 # Edit .env and set:
