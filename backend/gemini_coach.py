@@ -60,7 +60,7 @@ Rules:
 Sentence to analyse (do not echo it back):
 """
 
-DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
+DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
 
 
 def _extract_json_object(text: str) -> Optional[dict[str, Any]]:
