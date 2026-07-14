@@ -62,12 +62,6 @@ type TranscriptLine = {
   fillers: string[];
 };
 
-type LiveToast = {
-  id: string;
-  message: string;
-  variant: MeetToastVariant;
-};
-
 const RECOGNITION_LANGUAGES: { value: string; label: string }[] = [
   { value: 'en-US', label: 'English (US)' },
   { value: 'en-GB', label: 'English (UK)' },
@@ -147,7 +141,6 @@ export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewPro
   const [transcriptLines, setTranscriptLines] = useState<TranscriptLine[]>([]);
   const [sessionPhraseCount, setSessionPhraseCount] = useState(0);
   const [summary, setSummary] = useState<LiveSummaryReport | null>(null);
-  const [liveToasts, setLiveToasts] = useState<LiveToast[]>([]);
   const [audioRms, setAudioRms] = useState(0);
   const [silenceMs, setSilenceMs] = useState(0);
   const [speechMs, setSpeechMs] = useState(0);
@@ -168,7 +161,6 @@ export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewPro
     setTranscriptLines([]);
     setSessionPhraseCount(0);
     setSummary(null);
-    setLiveToasts([]);
     setAudioRms(0);
     setSilenceMs(0);
     setSpeechMs(0);
@@ -259,11 +251,6 @@ export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewPro
   const addToast = useCallback((message: string, variant: MeetToastVariant = 'default') => {
     const trimmed = message.trim();
     if (!trimmed) return;
-    const toast: LiveToast = { id: crypto.randomUUID(), message: trimmed, variant };
-    setLiveToasts((prev) => [toast, ...prev].slice(0, 4));
-    setTimeout(() => {
-      setLiveToasts((prev) => prev.filter((t) => t.id !== toast.id));
-    }, TOAST_DURATION_MS);
     sendMeetCoachToast({ message: trimmed, variant, durationMs: TOAST_DURATION_MS });
   }, []);
 
@@ -281,7 +268,6 @@ export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewPro
     setTranscriptLines([]);
     setSessionPhraseCount(0);
     setSummary(null);
-    setLiveToasts([]);
     setAudioRms(0);
     setSilenceMs(0);
     setSpeechMs(0);
@@ -552,7 +538,7 @@ export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewPro
         {isInMeeting && listening && (
           <div className="mb-4 rounded-lg border border-slate-600 overflow-hidden">
             <p className="text-xs text-slate-400 px-3 pt-2 pb-1 bg-slate-800/70 border-b border-slate-700/80">
-              Coaching tips appear on Meet (top-right) and in this panel. Live transcript is shown below.
+              Coaching tips appear on Meet (top-right). Live transcript is shown below.
             </p>
             <div className="px-3 pt-3 pb-1 bg-slate-800/70">
               <VoiceLevelBars deviceId={selectedDeviceId || undefined} active={listening} />
@@ -607,25 +593,6 @@ export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewPro
           </div>
         )}
       </main>
-
-      {liveToasts.length > 0 && (
-        <div className="fixed right-4 top-16 z-40 space-y-2 max-w-sm">
-          {liveToasts.map((toast) => (
-            <div
-              key={toast.id}
-              className={`rounded-lg border px-3 py-2 text-sm shadow-lg ${
-                toast.variant === 'warning'
-                  ? 'bg-amber-500/15 border-amber-400/40 text-amber-100'
-                  : toast.variant === 'suggestion'
-                    ? 'bg-emerald-500/15 border-emerald-400/40 text-emerald-100'
-                    : 'bg-slate-800/90 border-slate-600 text-slate-100'
-              }`}
-            >
-              {toast.message}
-            </div>
-          ))}
-        </div>
-      )}
 
       {summary && <SummaryModal summary={summary} onClose={() => setSummary(null)} />}
     </div>
