@@ -1,27 +1,72 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   useCoachingWebSocket,
-  type CoachingInsights,
-  type CoachingMessage,
-  type MeetingSummaryReport,
 } from '../hooks/useCoachingWebSocket';
 import { useSpeechTranscription } from '../hooks/useSpeechTranscription';
 import {
   sendMeetCoachToast,
-  sendMeetCoachToastBatch,
   type MeetToastVariant,
 } from '../utils/meetPageToastBridge';
 
 const MIC_DEVICE_KEY = 'meetingmirror-mic-device';
 const RECOGNITION_LANG_KEY = 'meetingmirror-recognition-lang';
-const TOAST_DURATION_MS = 3000;
+const TOAST_DURATION_MS = 3200;
+const FEEDBACK_COOLDOWN_MS = 9000;
+const LOW_VOICE_THRESHOLD = 0.018;
+const LOW_VOICE_STREAK_MS = 3500;
+const LONG_PAUSE_MS = 2600;
+const HIGH_FILLERS_PER_MIN = 3.2;
+const LOW_FILLERS_PER_MIN = 0.8;
+const FAST_WPM = 160;
+const SLOW_WPM = 90;
 
-function toastVariantForMessage(line: string): MeetToastVariant {
-  const l = line.toLowerCase();
-  if (l.includes('filler')) return 'warning';
-  if (l.includes('clearly') || l.includes('structure') || l.includes('concise')) return 'suggestion';
-  return 'default';
-}
+const FILLER_PHRASES = [
+  'you know',
+  'i mean',
+  'let me think',
+  'kind of',
+  'sort of',
+  'you see',
+];
+const FILLER_WORD_SET = new Set([
+  'um',
+  'uh',
+  'ah',
+  'er',
+  'hmm',
+  'like',
+  'actually',
+  'basically',
+  'literally',
+  'so',
+  'well',
+  'right',
+  'okay',
+]);
+const FILLER_REGEX_PATTERNS = [
+  /\b(?:u+h+|u+m+|h+m+|a+h+|e+r+)\b/gi,
+  /\b([a-z])\1{2,}\b/gi,
+] as const;
+
+type LiveSummaryReport = {
+  duration: string;
+  wpm: number;
+  filler_count: number;
+  top_fillers: string[];
+  feedback: string[];
+};
+
+type TranscriptLine = {
+  id: string;
+  text: string;
+  fillers: string[];
+};
+
+type LiveToast = {
+  id: string;
+  message: string;
+  variant: MeetToastVariant;
+};
 
 const RECOGNITION_LANGUAGES: { value: string; label: string }[] = [
   { value: 'en-US', label: 'English (US)' },
@@ -43,37 +88,100 @@ interface LiveCoachingViewProps {
   isInMeeting: boolean;
 }
 
+function nowMs() {
+  return Date.now();
+}
+
+function splitWords(text: string): string[] {
+  return (text.toLowerCase().match(/[a-z']+/g) ?? []).filter(Boolean);
+}
+
+function detectFillers(text: string): string[] {
+  const normalized = text.toLowerCase();
+  const words = splitWords(normalized);
+  const found: string[] = [];
+
+  for (const p of FILLER_PHRASES) {
+    const regex = new RegExp(`\\b${p.replace(' ', '\\s+')}\\b`, 'g');
+    const matches = normalized.match(regex);
+    if (matches) {
+      for (let i = 0; i < matches.length; i += 1) found.push(p);
+    }
+  }
+  for (const w of words) {
+    if (FILLER_WORD_SET.has(w)) found.push(w);
+  }
+  for (const pattern of FILLER_REGEX_PATTERNS) {
+    const matches = normalized.match(pattern);
+    if (matches) found.push(...matches.map((m) => m.toLowerCase()));
+  }
+  return found;
+}
+
+function highlightLineParts(text: string) {
+  const parts: { text: string; filler: boolean }[] = [];
+  const regex = /\b(?:you\s+know|i\s+mean|let\s+me\s+think|kind\s+of|sort\s+of|you\s+see|um+|uh+|ah+|er+|hmm+|like|actually|basically|literally|so|well|right|okay|([a-z])\1{2,})\b/gi;
+  let last = 0;
+  let match = regex.exec(text);
+  while (match) {
+    if (match.index > last) {
+      parts.push({ text: text.slice(last, match.index), filler: false });
+    }
+    parts.push({ text: match[0], filler: true });
+    last = regex.lastIndex;
+    match = regex.exec(text);
+  }
+  if (last < text.length) {
+    parts.push({ text: text.slice(last), filler: false });
+  }
+  return parts.length ? parts : [{ text, filler: false }];
+}
+
 export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewProps) {
-  const {
-    coachingMessage,
-    meetingSummary,
-    setMeetingSummary,
-    status,
-    sendTranscript,
-    sendProcessTranscript,
-    requestSummary,
-    resetSession,
-  } = useCoachingWebSocket(meetingId);
+  const { status, sendTranscript } = useCoachingWebSocket(meetingId);
 
   const clearMeetToasts = useCallback(() => {
     sendMeetCoachToast({ message: null });
   }, []);
 
-  const [feedbackHistory, setFeedbackHistory] = useState<{ id: string; msg: CoachingMessage }[]>([]);
-  const internalLinesRef = useRef<string[]>([]);
-  const [transcriptLines, setTranscriptLines] = useState<string[]>([]);
+  const [transcriptLines, setTranscriptLines] = useState<TranscriptLine[]>([]);
   const [sessionPhraseCount, setSessionPhraseCount] = useState(0);
-  const [processing, setProcessing] = useState(false);
-  const [processResult, setProcessResult] = useState<CoachingMessage | null>(null);
-  const processingResponsePendingRef = useRef(false);
+  const [summary, setSummary] = useState<LiveSummaryReport | null>(null);
+  const [liveToasts, setLiveToasts] = useState<LiveToast[]>([]);
+  const [audioRms, setAudioRms] = useState(0);
+  const [silenceMs, setSilenceMs] = useState(0);
+  const [speechMs, setSpeechMs] = useState(0);
+  const [totalWords, setTotalWords] = useState(0);
+  const [fillerTotal, setFillerTotal] = useState(0);
+  const [fillerCounts, setFillerCounts] = useState<Record<string, number>>({});
+  const [sessionStartAt, setSessionStartAt] = useState<number | null>(null);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
+  const feedbackCooldownRef = useRef<Record<string, number>>({});
+  const lowVoiceStreakRef = useRef(0);
+  const analyserCleanupRef = useRef<(() => void) | null>(null);
+  const speechMsRef = useRef(0);
+  const silenceMsRef = useRef(0);
+  const fillerTotalRef = useRef(0);
+  const totalWordsRef = useRef(0);
 
   useEffect(() => {
-    internalLinesRef.current = [];
     setTranscriptLines([]);
     setSessionPhraseCount(0);
-    setFeedbackHistory([]);
-    setProcessResult(null);
+    setSummary(null);
+    setLiveToasts([]);
+    setAudioRms(0);
+    setSilenceMs(0);
+    setSpeechMs(0);
+    setTotalWords(0);
+    setFillerTotal(0);
+    setFillerCounts({});
+    setSessionStartAt(null);
+    feedbackCooldownRef.current = {};
+    lowVoiceStreakRef.current = 0;
+    speechMsRef.current = 0;
+    silenceMsRef.current = 0;
+    fillerTotalRef.current = 0;
+    totalWordsRef.current = 0;
   }, [meetingId]);
 
   const [micDevices, setMicDevices] = useState<MediaDeviceInfo[]>([]);
@@ -110,9 +218,29 @@ export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewPro
     (text: string) => {
       const line = text.trim();
       if (!line) return;
-      internalLinesRef.current.push(line);
-      setTranscriptLines((prev) => [...prev, line]);
+      const fillers = detectFillers(line);
+      setTranscriptLines((prev) => [...prev, { id: crypto.randomUUID(), text: line, fillers }]);
       setSessionPhraseCount((c) => c + 1);
+      const wordsInLine = splitWords(line).length;
+      setTotalWords((prev) => {
+        const next = prev + wordsInLine;
+        totalWordsRef.current = next;
+        return next;
+      });
+      if (fillers.length > 0) {
+        setFillerTotal((prev) => {
+          const next = prev + fillers.length;
+          fillerTotalRef.current = next;
+          return next;
+        });
+        setFillerCounts((prev) => {
+          const next = { ...prev };
+          for (const filler of fillers) {
+            next[filler] = (next[filler] ?? 0) + 1;
+          }
+          return next;
+        });
+      }
       sendTranscript(line);
     },
     [sendTranscript]
@@ -125,29 +253,79 @@ export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewPro
     isListening,
     interim,
     error: recognitionError,
-  } = useSpeechTranscription(handleFinalTranscript, status === 'connected', recognitionLang);
+  } = useSpeechTranscription(handleFinalTranscript, isInMeeting, recognitionLang);
 
   const [listening, setListening] = useState(false);
+  const addToast = useCallback((message: string, variant: MeetToastVariant = 'default') => {
+    const trimmed = message.trim();
+    if (!trimmed) return;
+    const toast: LiveToast = { id: crypto.randomUUID(), message: trimmed, variant };
+    setLiveToasts((prev) => [toast, ...prev].slice(0, 4));
+    setTimeout(() => {
+      setLiveToasts((prev) => prev.filter((t) => t.id !== toast.id));
+    }, TOAST_DURATION_MS);
+    sendMeetCoachToast({ message: trimmed, variant, durationMs: TOAST_DURATION_MS });
+  }, []);
+
+  const triggerFeedback = useCallback((key: string, message: string, variant: MeetToastVariant = 'warning') => {
+    const now = nowMs();
+    const last = feedbackCooldownRef.current[key] ?? 0;
+    if (now - last < FEEDBACK_COOLDOWN_MS) return;
+    feedbackCooldownRef.current[key] = now;
+    addToast(message, variant);
+  }, [addToast]);
+
   const handleStartListening = async () => {
-    if (status === 'connected' && speechSupported) {
-      resetSession();
-      clearMeetToasts();
-      internalLinesRef.current = [];
-      setTranscriptLines([]);
-      setSessionPhraseCount(0);
-      setFeedbackHistory([]);
-      setProcessResult(null);
-      setMeetingSummary(null);
-      const ok = await startListening();
-      if (ok) await enumerateDevices();
-      setListening(ok);
-    }
+    if (!speechSupported) return;
+    clearMeetToasts();
+    setTranscriptLines([]);
+    setSessionPhraseCount(0);
+    setSummary(null);
+    setLiveToasts([]);
+    setAudioRms(0);
+    setSilenceMs(0);
+    setSpeechMs(0);
+    setTotalWords(0);
+    setFillerTotal(0);
+    setFillerCounts({});
+    feedbackCooldownRef.current = {};
+    lowVoiceStreakRef.current = 0;
+    speechMsRef.current = 0;
+    silenceMsRef.current = 0;
+    fillerTotalRef.current = 0;
+    totalWordsRef.current = 0;
+    setSessionStartAt(nowMs());
+    const ok = await startListening();
+    if (ok) await enumerateDevices();
+    setListening(ok);
   };
 
   const handleStopListening = () => {
     stopListening();
     setListening(false);
-    requestSummary();
+    const end = nowMs();
+    const durationMs = sessionStartAt ? Math.max(1000, end - sessionStartAt) : 1000;
+    const minutes = durationMs / 60000;
+    const wpm = Math.round(totalWordsRef.current / minutes);
+    const topFillers = Object.entries(fillerCounts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([name]) => name);
+    const feedback: string[] = [];
+    if (wpm > FAST_WPM) feedback.push('You spoke quickly overall. Slow down slightly.');
+    else if (wpm < SLOW_WPM) feedback.push('Your pace was a bit slow. Keep a steadier tempo.');
+    else feedback.push('Moderate speaking pace');
+    if (fillerTotalRef.current > 0) feedback.push('Reduce filler usage');
+    else feedback.push('Great clarity! Very low filler usage.');
+    if (audioRms < LOW_VOICE_THRESHOLD) feedback.push('Try speaking louder for better presence.');
+    if (silenceMsRef.current > LONG_PAUSE_MS) feedback.push('Avoid long pauses where possible.');
+    setSummary({
+      duration: `${Math.max(1, Math.round(durationMs / 60000))} min`,
+      wpm: Number.isFinite(wpm) ? wpm : 0,
+      filler_count: fillerTotalRef.current,
+      top_fillers: topFillers,
+      feedback,
+    });
   };
 
   useEffect(() => {
@@ -163,37 +341,32 @@ export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewPro
   }, [status, stopListening, clearMeetToasts]);
 
   useEffect(() => {
-    if (!coachingMessage?.toastMessages?.length) return;
+    if (!listening) return;
+    if (!sessionStartAt) return;
+    const tick = setInterval(() => {
+      const elapsedMinutes = Math.max(1 / 60, (nowMs() - sessionStartAt) / 60000);
+      const wpm = totalWordsRef.current / elapsedMinutes;
+      const fpm = fillerTotalRef.current / elapsedMinutes;
 
-    sendMeetCoachToastBatch(
-      coachingMessage.toastMessages.map((message) => ({
-        message,
-        variant: toastVariantForMessage(message),
-        durationMs: TOAST_DURATION_MS,
-      })),
-      TOAST_DURATION_MS
-    );
-
-    if (coachingMessage.system) {
-      if (processingResponsePendingRef.current) {
-        processingResponsePendingRef.current = false;
-        setProcessing(false);
+      if (fpm > HIGH_FILLERS_PER_MIN) {
+        triggerFeedback('high-fillers', 'Too many filler words. Try pausing instead.', 'warning');
+      } else if (totalWordsRef.current > 45 && fpm < LOW_FILLERS_PER_MIN) {
+        triggerFeedback('low-fillers', 'Great clarity! Keep it up.', 'suggestion');
       }
-      return;
-    }
-
-    if (processingResponsePendingRef.current) {
-      setProcessResult(coachingMessage);
-      processingResponsePendingRef.current = false;
-      setProcessing(false);
-      return;
-    }
-
-    setFeedbackHistory((prev) => [
-      { id: crypto.randomUUID(), msg: coachingMessage },
-      ...prev.slice(0, 49),
-    ]);
-  }, [coachingMessage]);
+      if (wpm > FAST_WPM) {
+        triggerFeedback('fast', "You're speaking too fast. Slow down.", 'warning');
+      } else if (totalWordsRef.current > 20 && wpm < SLOW_WPM) {
+        triggerFeedback('slow', 'Try to maintain a steady pace.', 'warning');
+      }
+      if (silenceMsRef.current > LONG_PAUSE_MS) {
+        triggerFeedback('long-pause', 'Try to avoid long pauses.', 'warning');
+      }
+      if (lowVoiceStreakRef.current > LOW_VOICE_STREAK_MS) {
+        triggerFeedback('low-voice', 'Your voice is too low. Speak louder.', 'warning');
+      }
+    }, 1500);
+    return () => clearInterval(tick);
+  }, [listening, sessionStartAt, triggerFeedback]);
 
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -206,26 +379,67 @@ export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewPro
   }, []);
 
   useEffect(() => {
-    if (!meetingSummary) return;
-    const lines: string[] = [];
-    lines.push('Summary report:');
-    lines.push(
-      `Filler words: ${meetingSummary.totalFillerWords}` +
-        (meetingSummary.mostUsedFillerWords.length
-          ? ` (${meetingSummary.mostUsedFillerWords.slice(0, 3).join(', ')})`
-          : '')
-    );
-    lines.push(`Pace: ${meetingSummary.speakingPace}`);
-    lines.push(`Volume: ${meetingSummary.volumeAnalysis}`);
-    lines.push(`Clarity score: ${meetingSummary.clarityScore}/100`);
-    if (meetingSummary.improvements.length) {
-      lines.push(`Suggestion: ${meetingSummary.improvements[0]}`);
+    if (!listening) {
+      analyserCleanupRef.current?.();
+      analyserCleanupRef.current = null;
+      return;
     }
-    sendMeetCoachToastBatch(
-      lines.map((message) => ({ message, durationMs: TOAST_DURATION_MS })),
-      TOAST_DURATION_MS
-    );
-  }, [meetingSummary]);
+    let disposed = false;
+    let intervalId: number | undefined;
+    let stream: MediaStream | null = null;
+    let ctx: AudioContext | null = null;
+
+    (async () => {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: selectedDeviceId ? { deviceId: { ideal: selectedDeviceId } } : true,
+        });
+        if (disposed) return;
+        ctx = new AudioContext();
+        const source = ctx.createMediaStreamSource(stream);
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 1024;
+        source.connect(analyser);
+        const data = new Uint8Array(analyser.fftSize);
+        let last = nowMs();
+        intervalId = window.setInterval(() => {
+          const t = nowMs();
+          const delta = t - last;
+          last = t;
+          analyser.getByteTimeDomainData(data);
+          let sum = 0;
+          for (let i = 0; i < data.length; i += 1) {
+            const v = data[i] / 128 - 1;
+            sum += v * v;
+          }
+          const rms = Math.sqrt(sum / data.length);
+          setAudioRms(rms);
+          if (rms < LOW_VOICE_THRESHOLD) {
+            lowVoiceStreakRef.current += delta;
+            silenceMsRef.current += delta;
+            setSilenceMs(silenceMsRef.current);
+          } else {
+            lowVoiceStreakRef.current = 0;
+            silenceMsRef.current = 0;
+            setSilenceMs(0);
+            speechMsRef.current += delta;
+            setSpeechMs(speechMsRef.current);
+          }
+        }, 220);
+      } catch {
+        // Non-blocking: transcript can still run without RMS metrics.
+      }
+    })();
+
+    const cleanup = () => {
+      disposed = true;
+      if (intervalId) window.clearInterval(intervalId);
+      stream?.getTracks().forEach((t) => t.stop());
+      ctx?.close();
+    };
+    analyserCleanupRef.current = cleanup;
+    return cleanup;
+  }, [listening, selectedDeviceId]);
 
   const statusLabel =
     status === 'connected' ? 'Live' : status === 'failed' ? 'Connection failed' : 'Connecting...';
@@ -275,7 +489,7 @@ export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewPro
           </div>
         )}
 
-        {isInMeeting && status === 'connected' && !listening && speechSupported && (
+        {isInMeeting && !listening && speechSupported && (
           <div className="mb-4 p-4 rounded-lg bg-teams-purple/20 border border-teams-purple/50 space-y-3">
             <div>
               <label className="block text-xs text-slate-400 mb-1 font-medium">🎤 Microphone</label>
@@ -323,7 +537,7 @@ export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewPro
           </div>
         )}
 
-        {isInMeeting && status === 'connected' && !speechSupported && (
+        {isInMeeting && !speechSupported && (
           <p className="mb-4 text-amber-400 text-sm">
             Microphone not supported in this browser. Use Chrome for speech capture.
           </p>
@@ -335,7 +549,7 @@ export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewPro
           </div>
         )}
 
-        {isInMeeting && status === 'connected' && listening && (
+        {isInMeeting && listening && (
           <div className="mb-4 rounded-lg border border-slate-600 overflow-hidden">
             <p className="text-xs text-slate-400 px-3 pt-2 pb-1 bg-slate-800/70 border-b border-slate-700/80">
               Coaching tips appear on Meet (top-right) and in this panel. Live transcript is shown below.
@@ -347,20 +561,33 @@ export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewPro
               {transcriptLines.length === 0 && !interim ? (
                 <p className="text-sm text-slate-500">Listening — keep speaking naturally.</p>
               ) : (
-                <p className="text-sm text-slate-200 leading-relaxed whitespace-pre-wrap">
-                  {transcriptLines.join(' ')}
+                <div className="space-y-2 text-sm leading-relaxed">
+                  {transcriptLines.map((line) => (
+                    <p key={line.id} className="text-slate-200 whitespace-pre-wrap">
+                      {highlightLineParts(line.text).map((part, index) => (
+                        <span key={`${line.id}-${index}`} className={part.filler ? 'text-red-300 font-medium' : ''}>
+                          {part.text}
+                        </span>
+                      ))}
+                    </p>
+                  ))}
                   {interim && (
-                    <>
-                      {transcriptLines.length > 0 ? ' ' : ''}
-                      <span className="text-emerald-300 italic">
-                        {interim}
-                        <span className="inline-block w-0.5 h-3.5 ml-0.5 bg-emerald-400 animate-pulse align-middle" />
-                      </span>
-                    </>
+                    <p className="text-emerald-300 italic whitespace-pre-wrap">
+                      {interim}
+                      <span className="inline-block w-0.5 h-3.5 ml-0.5 bg-emerald-400 animate-pulse align-middle" />
+                    </p>
                   )}
-                </p>
+                </div>
               )}
               <div ref={transcriptEndRef} className="h-0" aria-hidden />
+            </div>
+            <div className="grid grid-cols-2 gap-2 border-t border-slate-700 bg-slate-900/50 px-3 py-2 text-xs text-slate-300">
+              <div>WPM: {sessionStartAt ? Math.round(totalWords / Math.max((nowMs() - sessionStartAt) / 60000, 1 / 60)) : 0}</div>
+              <div>Fillers/min: {sessionStartAt ? (fillerTotal / Math.max((nowMs() - sessionStartAt) / 60000, 1 / 60)).toFixed(1) : '0.0'}</div>
+              <div>Total fillers: {fillerTotal}</div>
+              <div>Voice RMS: {audioRms.toFixed(3)}</div>
+              <div>Current pause: {(silenceMs / 1000).toFixed(1)}s</div>
+              <div>Speech duration: {(speechMs / 1000).toFixed(1)}s</div>
             </div>
             <div className="border-t border-slate-700 px-3 py-2 bg-slate-800/70">
               <button
@@ -374,96 +601,33 @@ export function LiveCoachingView({ meetingId, isInMeeting }: LiveCoachingViewPro
           </div>
         )}
 
-        {isInMeeting && status === 'connected' && !listening && sessionPhraseCount > 0 && (
-          <div className="mb-4 rounded-lg border border-slate-600 overflow-hidden">
-            <p className="text-xs text-slate-500 px-3 pt-2 pb-1 bg-slate-800/70 border-b border-slate-700">
-              Session has {sessionPhraseCount} phrase{sessionPhraseCount === 1 ? '' : 's'} captured (text stays private).
-            </p>
-            <div className="border-t border-slate-700 px-3 py-2 bg-slate-800/70">
-              <button
-                type="button"
-                onClick={() => {
-                  setProcessResult(null);
-                  processingResponsePendingRef.current = true;
-                  setProcessing(true);
-                  sendProcessTranscript(internalLinesRef.current.join(' '));
-                }}
-                disabled={processing}
-                className="w-full py-2 px-4 rounded-lg bg-teams-purple hover:bg-purple-600 disabled:opacity-50 text-white text-sm font-medium"
-              >
-                {processing ? 'Processing…' : 'Run coaching on session (no transcript shown)'}
-              </button>
-            </div>
-            {(processing || processResult) && (
-              <div className="border-t border-slate-700 px-3 py-3 bg-slate-900/80">
-                <p className="text-xs text-slate-500 mb-2 font-medium">Latest structured feedback</p>
-                {processing ? (
-                  <p className="text-sm text-slate-400 italic">Processing…</p>
-                ) : processResult ? (
-                  <InsightsCard insights={processResult.insights} />
-                ) : null}
-              </div>
-            )}
+        {isInMeeting && !listening && sessionPhraseCount > 0 && (
+          <div className="mb-4 rounded-lg border border-slate-600 overflow-hidden p-3 bg-slate-800/60 text-sm text-slate-300">
+            Session has {sessionPhraseCount} phrase{sessionPhraseCount === 1 ? '' : 's'} captured.
           </div>
-        )}
-
-        {feedbackHistory.length > 0 && (
-          <section className="mb-4">
-            <h2 className="text-sm font-medium text-slate-400 mb-2">Session insights</h2>
-            <ul className="space-y-3 list-none">
-              {feedbackHistory.map(({ id, msg }) => (
-                <li key={id}>
-                  <InsightsCard insights={msg.insights} />
-                </li>
-              ))}
-            </ul>
-          </section>
         )}
       </main>
 
-      {meetingSummary && (
-        <SummaryModal summary={meetingSummary} onClose={() => setMeetingSummary(null)} />
-      )}
-    </div>
-  );
-}
-
-function InsightsCard({ insights }: { insights: CoachingInsights }) {
-  const cardClass =
-    'rounded-xl shadow-lg p-4 transition-all duration-300 bg-slate-800/60 border border-slate-600';
-  const fillers = insights.fillerWordsDetected?.length
-    ? insights.fillerWordsDetected.join(', ')
-    : null;
-
-  return (
-    <div className={cardClass}>
-      {fillers && (
-        <div className="mb-2">
-          <p className="text-xs font-medium text-amber-400 uppercase tracking-wide mb-1">Filler words</p>
-          <p className="text-sm text-amber-200">{fillers}</p>
+      {liveToasts.length > 0 && (
+        <div className="fixed right-4 top-16 z-40 space-y-2 max-w-sm">
+          {liveToasts.map((toast) => (
+            <div
+              key={toast.id}
+              className={`rounded-lg border px-3 py-2 text-sm shadow-lg ${
+                toast.variant === 'warning'
+                  ? 'bg-amber-500/15 border-amber-400/40 text-amber-100'
+                  : toast.variant === 'suggestion'
+                    ? 'bg-emerald-500/15 border-emerald-400/40 text-emerald-100'
+                    : 'bg-slate-800/90 border-slate-600 text-slate-100'
+              }`}
+            >
+              {toast.message}
+            </div>
+          ))}
         </div>
       )}
-      <div className="mb-2 text-sm text-slate-200 space-y-1">
-        <p>
-          <span className="text-slate-400">Pace:</span> {insights.pace}
-        </p>
-        <p>
-          <span className="text-slate-400">Volume:</span> {insights.volume}
-        </p>
-        <p>
-          <span className="text-slate-400">Clarity:</span> {insights.clarity}
-        </p>
-      </div>
-      {insights.suggestions?.length > 0 && (
-        <div>
-          <p className="text-xs font-medium text-emerald-400 uppercase tracking-wide mb-1">Tips</p>
-          <ul className="list-disc list-inside text-sm text-emerald-200 space-y-1">
-            {insights.suggestions.map((s, i) => (
-              <li key={i}>{s}</li>
-            ))}
-          </ul>
-        </div>
-      )}
+
+      {summary && <SummaryModal summary={summary} onClose={() => setSummary(null)} />}
     </div>
   );
 }
@@ -472,7 +636,7 @@ function SummaryModal({
   summary,
   onClose,
 }: {
-  summary: MeetingSummaryReport;
+  summary: LiveSummaryReport;
   onClose: () => void;
 }) {
   const downloadJson = () => {
@@ -484,8 +648,6 @@ function SummaryModal({
     a.click();
     URL.revokeObjectURL(url);
   };
-
-  const altEntries = Object.entries(summary.suggestedAlternatives ?? {});
 
   return (
     <div
@@ -521,10 +683,10 @@ function SummaryModal({
             <h3 className="text-xs font-semibold text-amber-400 uppercase tracking-wide mb-2">
               1. Filler words
             </h3>
-            <p>Total detected: {summary.totalFillerWords}</p>
-            {summary.mostUsedFillerWords?.length > 0 && (
+            <p>Total detected: {summary.filler_count}</p>
+            {summary.top_fillers?.length > 0 && (
               <p className="mt-1 text-slate-300">
-                Most used: {summary.mostUsedFillerWords.join(', ')}
+                Most used: {summary.top_fillers.join(', ')}
               </p>
             )}
           </section>
@@ -532,45 +694,26 @@ function SummaryModal({
             <h3 className="text-xs font-semibold text-sky-400 uppercase tracking-wide mb-2">
               2. Speaking pace
             </h3>
-            <p className="capitalize">{summary.speakingPace.replace(/-/g, ' ')}</p>
+            <p>{summary.wpm} words/minute</p>
           </section>
           <section>
             <h3 className="text-xs font-semibold text-violet-400 uppercase tracking-wide mb-2">
-              3. Volume &amp; clarity
+              3. Session duration
             </h3>
-            <p>Volume: {summary.volumeAnalysis}</p>
-            <p>Clarity score: {summary.clarityScore}/100</p>
+            <p>{summary.duration}</p>
           </section>
           <section>
             <h3 className="text-xs font-semibold text-emerald-400 uppercase tracking-wide mb-2">
-              4. Actionable improvements
+              4. Actionable feedback
             </h3>
-            {summary.improvements?.length ? (
+            {summary.feedback?.length ? (
               <ul className="list-disc list-inside space-y-1">
-                {summary.improvements.map((x, i) => (
+                {summary.feedback.map((x, i) => (
                   <li key={i}>{x}</li>
                 ))}
               </ul>
             ) : (
               <p className="text-slate-500">No major issues recorded.</p>
-            )}
-          </section>
-          <section>
-            <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">
-              5. Better word suggestions
-            </h3>
-            {altEntries.length === 0 ? (
-              <p className="text-slate-500">No filler replacements suggested.</p>
-            ) : (
-              <ul className="space-y-2 list-none">
-                {altEntries.map(([word, alts]) => (
-                  <li key={word} className="text-slate-300">
-                    <span className="text-amber-200 font-medium">{word}</span>
-                    <span className="text-slate-500"> → </span>
-                    {alts.join(', ')}
-                  </li>
-                ))}
-              </ul>
             )}
           </section>
         </div>
